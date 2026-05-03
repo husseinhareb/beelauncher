@@ -1,0 +1,45 @@
+[package]
+name = "beelauncher"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[[bin]]
+name = "beelauncher"
+path = "src/main.rs"
+
+[dependencies]
+# Wayland + layer-shell
+smithay-client-toolkit = { version = "0.19", features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.31", features = ["client"] }
+wayland-protocols-wlr = { version = "0.2", features = ["client"] }
+
+# Event loop
+calloop = "0.13"
+
+# Font rendering
+fontdue = "0.9"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Utilities
+dirs = "5"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+memmap2 = "0.9"
+libc = "0.2"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
