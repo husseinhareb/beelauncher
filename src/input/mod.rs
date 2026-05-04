@@ -3,7 +3,7 @@
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers};
 
 /// High-level actions emitted by the input handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Printable character appended to query.
     Char(char),

@@ -35,6 +35,10 @@ pub struct WindowConfig {
     pub anchor: Anchor,
     /// Vertical offset from anchor in pixels.
     pub margin_top: i32,
+    /// Icon size in pixels when --show icons is active.
+    /// Defaults to the nearest XDG standard size to the font line height.
+    /// Setting this larger also increases row height to match.
+    pub icon_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -133,6 +137,7 @@ impl Default for WindowConfig {
             max_entries: 10,
             anchor: Anchor::Center,
             margin_top: 0,
+            icon_size: None,
         }
     }
 }
@@ -223,6 +228,7 @@ width       = 640
 max_entries = 10
 anchor      = "center"
 margin_top  = 0
+# icon_size = 32   # override icon size (also enlarges each row)
 
 [theme]
 background   = { r = 30,  g = 30,  b = 46,  a = 255 }

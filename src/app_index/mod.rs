@@ -1,7 +1,8 @@
 //! Desktop file indexing: parse, cache, and expose application entries.
 //!
-//! Cache format: a simple binary file (bincode-style manual serialization avoided;
-//! we use a flat text cache instead for zero-dependency, forward-compatible reads).
+//! Cache format: plain text, first line is a magic/version tag.
+//! If the tag doesn't match CACHE_VERSION the file is discarded and rebuilt.
+//! Bump CACHE_VERSION whenever the per-entry field layout changes.
 
 use std::{
     fs,
@@ -27,6 +28,8 @@ pub struct AppEntry {
     pub exec:    String,
     /// Lowercase name used for matching — precomputed once.
     pub name_lc: String,
+    /// Icon name or absolute path from the Icon= field, if present.
+    pub icon:    Option<String>,
 }
 
 /// Loaded index of all known applications.
@@ -58,6 +61,10 @@ impl AppIndex {
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
+/// Increment this string whenever the per-entry line layout changes.
+/// Any cache file whose first line doesn't match is silently discarded.
+const CACHE_VERSION: &str = "beelauncher-cache-v2";
+
 fn cache_path() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -73,23 +80,18 @@ fn desktop_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Returns max mtime across all .desktop files in all dirs.
+/// Returns the most recent mtime across all watched desktop directories.
+///
+/// We stat the directories themselves, not individual files inside them.
+/// When any file is added, removed, or renamed in a directory, the kernel
+/// updates that directory's mtime — regardless of the file's own timestamp.
+/// This means a freshly installed package is always detected, even when the
+/// package manager preserves the upstream build date on the .desktop file.
 fn max_mtime(dirs: &[PathBuf]) -> SystemTime {
-    let mut max = SystemTime::UNIX_EPOCH;
-    for dir in dirs {
-        let Ok(rd) = fs::read_dir(dir) else { continue };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.extension().map(|e| e == "desktop").unwrap_or(false) {
-                if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
-                    if m > max {
-                        max = m;
-                    }
-                }
-            }
-        }
-    }
-    max
+    dirs.iter()
+        .filter_map(|dir| fs::metadata(dir).and_then(|m| m.modified()).ok())
+        .max()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn try_load_cache(cache: &Path, dirs: &[PathBuf]) -> Result<Vec<AppEntry>, ()> {
@@ -105,10 +107,18 @@ fn try_load_cache(cache: &Path, dirs: &[PathBuf]) -> Result<Vec<AppEntry>, ()> {
     let reader = io::BufReader::new(file);
     let mut lines = reader.lines();
 
+    // First line must be the version tag — reject any cache with a different layout.
+    match lines.next() {
+        Some(Ok(ref tag)) if tag == CACHE_VERSION => {}
+        _ => return Err(()),
+    }
+
     while let Some(Ok(name)) = lines.next() {
         let exec = lines.next().and_then(|l| l.ok()).unwrap_or_default();
+        let icon_line = lines.next().and_then(|l| l.ok()).unwrap_or_default();
+        let icon = if icon_line.is_empty() { None } else { Some(icon_line) };
         let name_lc = name.to_lowercase();
-        entries.push(AppEntry { name, exec, name_lc });
+        entries.push(AppEntry { name, exec, name_lc, icon });
     }
 
     Ok(entries)
@@ -119,9 +129,11 @@ fn write_cache(cache: &Path, entries: &[AppEntry]) -> Result<(), io::Error> {
         fs::create_dir_all(parent)?;
     }
     let mut file = fs::File::create(cache)?;
+    writeln!(file, "{CACHE_VERSION}")?;
     for e in entries {
         writeln!(file, "{}", e.name)?;
         writeln!(file, "{}", e.exec)?;
+        writeln!(file, "{}", e.icon.as_deref().unwrap_or(""))?;
     }
     Ok(())
 }
@@ -152,6 +164,7 @@ fn parse_desktop_file(path: &Path) -> Option<AppEntry> {
     let mut in_desktop_section = false;
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
+    let mut icon: Option<String> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -163,7 +176,6 @@ fn parse_desktop_file(path: &Path) -> Option<AppEntry> {
             continue;
         }
 
-        // Fast key extraction without splitting the whole line.
         if let Some(rest) = line.strip_prefix("Name=") {
             if name.is_none() {
                 name = Some(rest.to_owned());
@@ -172,12 +184,15 @@ fn parse_desktop_file(path: &Path) -> Option<AppEntry> {
             if exec.is_none() {
                 exec = Some(rest.to_owned());
             }
+        } else if let Some(rest) = line.strip_prefix("Icon=") {
+            if icon.is_none() && !rest.is_empty() {
+                icon = Some(rest.to_owned());
+            }
         } else if let Some(rest) = line.strip_prefix("NoDisplay=") {
             if rest.eq_ignore_ascii_case("true") {
                 return None;
             }
         } else if let Some(rest) = line.strip_prefix("Type=") {
-            // Only include Application entries.
             if !rest.eq_ignore_ascii_case("Application") && exec.is_none() && name.is_none() {
                 return None;
             }
@@ -187,5 +202,5 @@ fn parse_desktop_file(path: &Path) -> Option<AppEntry> {
     let name = name?;
     let exec = exec?;
     let name_lc = name.to_lowercase();
-    Some(AppEntry { name, exec, name_lc })
+    Some(AppEntry { name, exec, name_lc, icon })
 }

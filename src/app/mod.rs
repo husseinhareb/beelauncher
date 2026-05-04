@@ -2,8 +2,10 @@
 
 use crate::{
     app_index::AppIndex,
+    cli::Options,
     config::Config,
     exec,
+    frequency::FrequencyMap,
     input::Action,
     search,
     ui::Renderer,
@@ -12,6 +14,7 @@ use crate::{
 pub struct AppState {
     pub index:    AppIndex,
     pub renderer: Renderer,
+    pub freq:     FrequencyMap,
     /// Current search query (typed by the user).
     pub query:    String,
     /// Filtered + scored results for the current query.
@@ -25,9 +28,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(cfg: &Config, opts: &Options) -> Self {
         let index = AppIndex::load();
-        let renderer = Renderer::new(cfg);
+        let freq  = FrequencyMap::load();
+        let renderer = Renderer::new(cfg, opts.show_icons);
 
         // SAFETY: We extend the lifetime of Match borrows to 'static here.
         // The `index` field owns the AppEntry data and lives as long as AppState.
@@ -35,13 +39,14 @@ impl AppState {
         let results = unsafe {
             let entries: &'static [crate::app_index::AppEntry] =
                 std::mem::transmute(index.entries.as_slice());
-            search::filter("", entries)
+            search::filter("", entries, &freq)
         };
 
         Self {
             index,
             renderer,
-            query: String::with_capacity(64),
+            freq,
+            query:    String::with_capacity(64),
             results,
             selected: 0,
             scroll:   0,
@@ -99,7 +104,7 @@ impl AppState {
             }
             Action::Confirm => {
                 if !self.results.is_empty() || (cfg.behavior.launch_on_empty && !self.query.is_empty()) {
-                    self.launch(cfg);
+                    self.launch();
                 }
                 false
             }
@@ -125,7 +130,7 @@ impl AppState {
         self.results = unsafe {
             let entries: &'static [crate::app_index::AppEntry] =
                 std::mem::transmute(self.index.entries.as_slice());
-            search::filter(&self.query, entries)
+            search::filter(&self.query, entries, &self.freq)
         };
         self.selected = 0;
         self.scroll = 0;
@@ -140,15 +145,24 @@ impl AppState {
         }
     }
 
-    fn launch(&self, _cfg: &Config) {
-        let exec = if self.results.is_empty() {
-            self.query.as_str()
+    fn launch(&mut self) {
+        // Clone the strings we need before any mutable operations.
+        let (name, exec) = if self.results.is_empty() {
+            (self.query.clone(), self.query.clone())
         } else {
-            self.results[self.selected].entry.exec.as_str()
+            let entry = self.results[self.selected].entry;
+            (entry.name.clone(), entry.exec.clone())
         };
 
-        if let Err(e) = exec::launch(exec) {
+        // Record the launch before spawning so a crash in spawn doesn't lose the count.
+        self.freq.increment(&name);
+
+        // Refilter so the updated score is live for any subsequent interaction.
+        self.refilter();
+
+        if let Err(e) = exec::launch(&exec) {
             log::error!("launch failed: {e}");
         }
+        self.should_exit = true;
     }
 }
