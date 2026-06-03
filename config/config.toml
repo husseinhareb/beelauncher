@@ -1,8 +1,9 @@
 [window]
-width       = 640
-max_entries = 10
+width       = 720
+max_entries = 5
 anchor      = "center"
 margin_top  = 0
+icon_size   = 48
 
 [theme]
 background   = { r = 30,  g = 30,  b = 46,  a = 255 }
@@ -13,7 +14,7 @@ input_bg     = { r = 49,  g = 50,  b = 68,  a = 255 }
 border       = { r = 137, g = 180, b = 250, a = 255 }
 border_width  = 1
 corner_radius = 8
-row_padding   = 6
+row_padding   = 12
 input_padding = 8
 
 [font]
