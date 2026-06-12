@@ -75,10 +75,10 @@ pub fn run(cfg: Config, opts: Options) -> anyhow::Result<()> {
     let w = app_state.renderer.layout.width;
     let h = app_state.renderer.layout.total_height;
 
-    configure_layer_surface(&layer_surface, &cfg, w, h);
+    configure_layer_surface(&layer_surface);
     layer_surface.commit();
 
-    // Allocate enough for two frames to allow double-buffering.
+    // Small initial pool; reallocated to full-screen size in the configure handler.
     let pool = SlotPool::new((w * h * 4 * 2) as usize, &shm)?;
 
     let conn_fd = conn.as_fd().as_raw_fd();
@@ -103,6 +103,10 @@ pub fn run(cfg: Config, opts: Options) -> anyhow::Result<()> {
         repeat_next:        None,
         cursor_pos:         None,
         scroll_accumulator: 0.0,
+        screen_width:       0,
+        screen_height:      0,
+        launcher_x:         0,
+        launcher_y:         0,
     };
 
     loop {
@@ -155,19 +159,13 @@ pub fn run(cfg: Config, opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn configure_layer_surface(ls: &LayerSurface, cfg: &Config, w: u32, h: u32) {
-    use crate::config::Anchor as CA;
-
-    ls.set_size(w, h);
+fn configure_layer_surface(ls: &LayerSurface) {
+    // Cover the full screen so we receive pointer events everywhere.
+    // The launcher widget is composited at the correct offset inside draw().
+    ls.set_size(0, 0);
+    ls.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    ls.set_exclusive_zone(-1);
     ls.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-
-    let anchor = match cfg.window.anchor {
-        CA::Top    => Anchor::TOP,
-        CA::Bottom => Anchor::BOTTOM,
-        CA::Center => Anchor::empty(),
-    };
-    ls.set_anchor(anchor);
-    ls.set_margin(cfg.window.margin_top, 0, 0, 0);
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -190,10 +188,16 @@ struct WaylandState {
     repeat_info:        RepeatInfo,
     repeat_key:         Option<KeyEvent>,
     repeat_next:        Option<Instant>,
-    /// Last known pointer position in surface-local coordinates.
+    /// Last known pointer position in surface-local (screen) coordinates.
     cursor_pos:         Option<(f64, f64)>,
     /// Accumulated smooth-scroll delta (resets on discrete scroll events).
     scroll_accumulator: f64,
+    /// Full screen dimensions reported by the compositor.
+    screen_width:       u32,
+    screen_height:      u32,
+    /// Top-left of the launcher widget within the full-screen surface.
+    launcher_x:         u32,
+    launcher_y:         u32,
 }
 
 impl WaylandState {
@@ -211,42 +215,90 @@ impl WaylandState {
         }
     }
 
-    /// Return the result-list index at surface position `pos`, or None if the
-    /// position is over the input field or past the last result.
+    /// Compute the launcher widget offset within the full-screen surface and
+    /// store it in launcher_x / launcher_y.
+    fn update_launcher_offset(&mut self) {
+        use crate::config::Anchor as CA;
+        let sw = self.screen_width;
+        let sh = self.screen_height;
+        let lw = self.width;
+        let lh = self.height;
+        let margin = self.cfg.window.margin_top.max(0) as u32;
+
+        self.launcher_x = sw.saturating_sub(lw) / 2;
+        self.launcher_y = match self.cfg.window.anchor {
+            CA::Top    => margin,
+            CA::Bottom => sh.saturating_sub(lh + margin),
+            CA::Center => sh.saturating_sub(lh) / 2,
+        };
+    }
+
+    /// True when `pos` (screen coords) is inside the launcher widget.
+    fn inside_launcher(&self, pos: (f64, f64)) -> bool {
+        pos.0 >= self.launcher_x as f64
+            && pos.0 <  self.launcher_x as f64 + self.width  as f64
+            && pos.1 >= self.launcher_y as f64
+            && pos.1 <  self.launcher_y as f64 + self.height as f64
+    }
+
+    /// Return the result-list index at screen position `pos`, or None if the
+    /// position is over the input field, outside the launcher, or past the last result.
     fn hit_row(&self, pos: (f64, f64)) -> Option<usize> {
+        if !self.inside_launcher(pos) { return None; }
         let layout = &self.app.renderer.layout;
-        let y = pos.1 as u32;
-        if y < layout.input_height { return None; }
-        let row = ((y - layout.input_height) / layout.row_height) as usize;
+        let rel_y = (pos.1 as u32).saturating_sub(self.launcher_y);
+        if rel_y < layout.input_height { return None; }
+        let row = ((rel_y - layout.input_height) / layout.row_height) as usize;
         let idx = self.app.scroll + row;
         if idx < self.app.results.len() { Some(idx) } else { None }
     }
 
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
-        let buf_len = (self.width * self.height * 4) as usize;
+        let sw = self.screen_width;
+        let sh = self.screen_height;
+        if sw == 0 || sh == 0 { return; }
+
+        let screen_pixels = (sw * sh) as usize;
         let (buffer, canvas) = self.pool
             .create_buffer(
-                self.width as i32,
-                self.height as i32,
-                (self.width * 4) as i32,
+                sw as i32,
+                sh as i32,
+                (sw * 4) as i32,
                 wl_shm::Format::Argb8888,
             )
             .expect("shm buffer allocation");
 
-        // SAFETY: canvas is u8 slice from wl_shm, guaranteed 4-byte aligned,
-        // length is width * height * 4 (a multiple of 4).
+        // SAFETY: canvas is a u8 slice from wl_shm, 4-byte aligned,
+        // length is sw * sh * 4 (a multiple of 4).
         let pixels = unsafe {
             std::slice::from_raw_parts_mut(
                 canvas.as_mut_ptr() as *mut u32,
-                buf_len / 4,
+                screen_pixels,
             )
         };
 
-        self.app.render_frame(pixels);
+        // Full-screen transparent background.
+        pixels.fill(0x00_00_00_00);
+
+        // Render the launcher into a temporary buffer then blit it.
+        let lw = self.width as usize;
+        let lh = self.height as usize;
+        let mut launcher_buf = vec![0u32; lw * lh];
+        self.app.render_frame(&mut launcher_buf);
+
+        let lx = self.launcher_x as usize;
+        let ly = self.launcher_y as usize;
+        for row in 0..lh {
+            let src = &launcher_buf[row * lw..(row + 1) * lw];
+            let dst_start = (ly + row) * sw as usize + lx;
+            if dst_start + lw <= pixels.len() {
+                pixels[dst_start..dst_start + lw].copy_from_slice(src);
+            }
+        }
 
         let surface = self.layer_surface.wl_surface();
         surface.attach(Some(buffer.wl_buffer()), 0, 0);
-        surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        surface.damage_buffer(0, 0, sw as i32, sh as i32);
         surface.commit();
     }
 }
@@ -292,9 +344,19 @@ impl LayerShellHandler for WaylandState {
         _: &Connection,
         _qh: &QueueHandle<Self>,
         _: &LayerSurface,
-        _configure: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let (sw, sh) = configure.new_size;
+        if sw > 0 && sh > 0 {
+            self.screen_width  = sw;
+            self.screen_height = sh;
+            // Reallocate the pool to hold two full-screen frames.
+            let needed = (sw * sh * 4 * 2) as usize;
+            self.pool = SlotPool::new(needed, &self.shm)
+                .expect("pool resize for full-screen");
+            self.update_launcher_offset();
+        }
         self.configured = true;
         self.dirty = true;
     }
@@ -435,8 +497,13 @@ impl PointerHandler for WaylandState {
 
                 PointerEventKind::Press { button, .. } => match *button {
                     BTN_LEFT => {
-                        // Select the clicked row then confirm (launch).
                         if let Some(pos) = self.cursor_pos {
+                            if !self.inside_launcher(pos) {
+                                // Click outside the launcher widget — dismiss.
+                                self.app.should_exit = true;
+                                self.exit = true;
+                                continue;
+                            }
                             if let Some(idx) = self.hit_row(pos) {
                                 self.app.selected = idx;
                             }
