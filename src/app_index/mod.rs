@@ -5,6 +5,8 @@
 //! Bump CACHE_VERSION whenever the per-entry field layout changes.
 
 use std::{
+    collections::HashSet,
+    ffi::OsString,
     fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
@@ -63,7 +65,7 @@ impl AppIndex {
 
 /// Increment this string whenever the per-entry line layout changes.
 /// Any cache file whose first line doesn't match is silently discarded.
-const CACHE_VERSION: &str = "beelauncher-cache-v2";
+const CACHE_VERSION: &str = "beelauncher-cache-v3";
 
 fn cache_path() -> PathBuf {
     dirs::cache_dir()
@@ -73,9 +75,30 @@ fn cache_path() -> PathBuf {
 }
 
 fn desktop_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/usr/share/applications")];
+    let mut dirs = Vec::new();
     if let Some(home) = dirs::data_local_dir() {
         dirs.push(home.join("applications"));
+    }
+
+    let data_dirs = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+    if !data_dirs.is_empty() {
+        for p in data_dirs.split(':') {
+            if !p.is_empty() {
+                let dir = PathBuf::from(p).join("applications");
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+    } else {
+        let local_share = PathBuf::from("/usr/local/share/applications");
+        if !dirs.contains(&local_share) {
+            dirs.push(local_share);
+        }
+        let usr_share = PathBuf::from("/usr/share/applications");
+        if !dirs.contains(&usr_share) {
+            dirs.push(usr_share);
+        }
     }
     dirs
 }
@@ -142,11 +165,17 @@ fn write_cache(cache: &Path, entries: &[AppEntry]) -> Result<(), io::Error> {
 
 fn build_index(dirs: &[PathBuf]) -> Vec<AppEntry> {
     let mut entries = Vec::with_capacity(256);
+    let mut seen_ids: HashSet<OsString> = HashSet::new();
+
     for dir in dirs {
         let Ok(rd) = fs::read_dir(dir) else { continue };
         for item in rd.flatten() {
             let path = item.path();
             if path.extension().map(|e| e == "desktop").unwrap_or(false) {
+                let file_name = item.file_name();
+                if !seen_ids.insert(file_name) {
+                    continue;
+                }
                 if let Some(entry) = parse_desktop_file(&path) {
                     entries.push(entry);
                 }
@@ -203,4 +232,67 @@ fn parse_desktop_file(path: &Path) -> Option<AppEntry> {
     let exec = exec?;
     let name_lc = name.to_lowercase();
     Some(AppEntry { name, exec, name_lc, icon })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn test_deduplication_overrides_lower_priority() {
+        let temp_dir = std::env::temp_dir().join(format!("beelauncher_test_{}", std::process::id()));
+        let user_apps = temp_dir.join("user_apps");
+        let sys_apps = temp_dir.join("sys_apps");
+
+        fs::create_dir_all(&user_apps).unwrap();
+        fs::create_dir_all(&sys_apps).unwrap();
+
+        let user_claude = user_apps.join("claude.desktop");
+        let sys_claude = sys_apps.join("claude.desktop");
+
+        let mut f1 = File::create(&user_claude).unwrap();
+        writeln!(f1, "[Desktop Entry]\nName=Claude User\nExec=claude-user\nType=Application").unwrap();
+
+        let mut f2 = File::create(&sys_claude).unwrap();
+        writeln!(f2, "[Desktop Entry]\nName=Claude Sys\nExec=claude-sys\nType=Application").unwrap();
+
+        let entries = build_index(&[user_apps.clone(), sys_apps.clone()]);
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Claude User");
+        assert_eq!(entries[0].exec, "claude-user");
+    }
+
+    #[test]
+    fn test_nodisplay_shadows_lower_priority() {
+        let temp_dir = std::env::temp_dir().join(format!("beelauncher_test_nodisplay_{}", std::process::id()));
+        let user_apps = temp_dir.join("user_apps");
+        let sys_apps = temp_dir.join("sys_apps");
+
+        fs::create_dir_all(&user_apps).unwrap();
+        fs::create_dir_all(&sys_apps).unwrap();
+
+        let user_app = user_apps.join("app.desktop");
+        let sys_app = sys_apps.join("app.desktop");
+
+        let mut f1 = File::create(&user_app).unwrap();
+        writeln!(f1, "[Desktop Entry]\nName=App\nExec=app\nNoDisplay=true\nType=Application").unwrap();
+
+        let mut f2 = File::create(&sys_app).unwrap();
+        writeln!(f2, "[Desktop Entry]\nName=App\nExec=app\nType=Application").unwrap();
+
+        let entries = build_index(&[user_apps.clone(), sys_apps.clone()]);
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_live_index_no_duplicate_claude() {
+        let index = AppIndex::load();
+        let claude_count = index.entries.iter().filter(|e| e.name == "Claude").count();
+        assert_eq!(claude_count, 1);
+    }
 }
